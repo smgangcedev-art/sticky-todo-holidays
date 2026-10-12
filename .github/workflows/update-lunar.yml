@@ -1,0 +1,144 @@
+name: Update Korean lunar calendar
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '47 18 1 * *'
+  push:
+    paths:
+      - '.github/workflows/update-lunar.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: korean-holidays
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Fetch official lunar calendar
+        env:
+          DATA_GO_KR_SERVICE_KEY: ${{ secrets.DATA_GO_KR_SERVICE_KEY }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime as dt
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          ENDPOINT = 'https://apis.data.go.kr/B090041/openapi/service/LrsrCldInfoService/getLunCalInfo'
+          MAX_BYTES = 1024 * 1024
+
+          class SafeError(Exception):
+              pass
+
+          def parse_page(raw, year, month):
+              if len(raw) > MAX_BYTES:
+                  raise SafeError('API response is too large.')
+              try:
+                  root = ET.fromstring(raw)
+                  if root.findtext('./header/resultCode') != '00':
+                      raise SafeError('API rejected the request. Check lunar API approval, secret and quota.')
+                  total = int(root.findtext('./body/totalCount', '-1'))
+                  if not 1 <= total <= 31:
+                      raise SafeError('Unexpected lunar record count.')
+                  rows = []
+                  for item in root.findall('./body/items/item'):
+                      solar = dt.date(int(item.findtext('solYear')), int(item.findtext('solMonth')), int(item.findtext('solDay')))
+                      ly, lm, ld = (int(item.findtext(k)) for k in ('lunYear', 'lunMonth', 'lunDay'))
+                      leap = item.findtext('lunLeapmonth', '').strip()
+                      if solar.year != year or solar.month != month or ly not in (year-1, year) or not 1 <= lm <= 12 or not 1 <= ld <= 30 or leap not in ('평', '윤'):
+                          raise SafeError('Invalid lunar record.')
+                      rows.append({'date': solar.isoformat(), 'year': ly, 'month': lm, 'day': ld, 'leap': leap == '윤'})
+                  return total, len(rows), rows
+              except (ValueError, TypeError, ET.ParseError):
+                  raise SafeError('Invalid lunar API response.') from None
+
+          def fetch_page(key, year, month, page):
+              params = urllib.parse.urlencode({'ServiceKey': key, 'solYear': year, 'solMonth': f'{month:02d}', 'pageNo': page, 'numOfRows': 100})
+              for attempt in range(3):
+                  try:
+                      request = urllib.request.Request(ENDPOINT + '?' + params, headers={'User-Agent': 'StickyTodo-Lunar/1.0'})
+                      with urllib.request.urlopen(request, timeout=25) as response:
+                          return response.read(MAX_BYTES + 1)
+                  except (urllib.error.URLError, TimeoutError, OSError):
+                      if attempt == 2:
+                          raise SafeError('API connection failed. Retry later; check API approval and secret.') from None
+                      time.sleep(2 ** attempt)
+
+          def fetch_month(key, year, month):
+              import calendar
+              rows, expected = [], None
+              for page in range(1, 5):
+                  total, count, found = parse_page(fetch_page(key, year, month, page), year, month)
+                  if expected is not None and total != expected:
+                      raise SafeError('API changed during pagination.')
+                  expected = total
+                  rows.extend(found)
+                  if len(rows) == total:
+                      dates = {row['date'] for row in rows}
+                      required = {dt.date(year, month, d).isoformat() for d in range(1, calendar.monthrange(year, month)[1]+1)}
+                      if dates != required or len(dates) != len(rows):
+                          raise SafeError('Missing or duplicate lunar dates. Existing data was not changed.')
+                      return rows
+                  if count == 0 or len(rows) > total:
+                      break
+              raise SafeError('Incomplete lunar API pagination.')
+
+          def main():
+              key = os.environ.get('DATA_GO_KR_SERVICE_KEY', '').strip()
+              if not key or len(key) > 2048 or any(c.isspace() for c in key):
+                  raise SafeError('Set repository secret DATA_GO_KR_SERVICE_KEY to the Decoding service key.')
+              # Accept an accidentally pasted Encoding key without double encoding it.
+              if '%' in key:
+                  key = urllib.parse.unquote(key)
+              now = dt.datetime.now(dt.timezone.utc)
+              year = now.astimezone(dt.timezone(dt.timedelta(hours=9))).year
+              years = [year-1, year, year+1]
+              rows = []
+              for target in years:
+                  for month in range(1, 13):
+                      rows.extend(fetch_month(key, target, month))
+              doc = {'version': 1, 'country': 'KR', 'source': 'https://www.data.go.kr/data/15012679/openapi.do', 'updatedAt': now.isoformat(), 'years': years, 'days': sorted(rows, key=lambda row: row['date'])}
+              output = Path('data/kr-lunar.json')
+              output.parent.mkdir(exist_ok=True)
+              temporary = output.with_suffix('.tmp')
+              temporary.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+              temporary.replace(output)
+              print('Updated lunar data for ' + ', '.join(map(str, doc['years'])) + '.')
+
+          if __name__ == '__main__':
+              try:
+                  main()
+              except SafeError as error:
+                  print(str(error), file=sys.stderr)
+                  sys.exit(1)
+              except Exception:
+                  # Never print request URLs or exception traces containing the service key.
+                  print('Update failed. Existing data was not changed; check the configuration and retry.', file=sys.stderr)
+                  sys.exit(1)
+          PY
+      - name: Publish lunar JSON
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- data/kr-lunar.json
+          if git diff --cached --quiet; then
+            echo 'No lunar data changes.'
+          else
+            git commit -m 'Update Korean lunar calendar'
+            git push
+          fi
