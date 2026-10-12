@@ -1,0 +1,170 @@
+name: Update Korean holidays
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 18 * * *'
+  push:
+    paths:
+      - '.github/workflows/update-holidays.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: korean-holidays
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Fetch official holidays
+        env:
+          DATA_GO_KR_SERVICE_KEY: ${{ secrets.DATA_GO_KR_SERVICE_KEY }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime as dt
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          ENDPOINT = 'https://apis.data.go.kr/B090041/openapi/service/SpcdeInfoService/getRestDeInfo'
+          MAX_BYTES = 1024 * 1024
+
+          class SafeError(Exception):
+              pass
+
+          def parse_page(raw, year):
+              if len(raw) > MAX_BYTES:
+                  raise SafeError('API response is too large.')
+              try:
+                  root = ET.fromstring(raw)
+              except ET.ParseError:
+                  raise SafeError('API did not return valid XML. Retry later.') from None
+              if root.findtext('./header/resultCode') != '00':
+                  raise SafeError('API rejected the request. Check secret, API approval and quota.')
+              body = root.find('body')
+              if body is None:
+                  raise SafeError('Missing API response body.')
+              try:
+                  total = int(body.findtext('totalCount', '-1'))
+              except ValueError:
+                  raise SafeError('Invalid API count.') from None
+              if not 0 <= total <= 1000:
+                  raise SafeError('Unexpected API count.')
+              items = body.findall('./items/item')
+              rows = []
+              for item in items:
+                  date = item.findtext('locdate', '').strip()
+                  name = item.findtext('dateName', '').strip()
+                  flag = item.findtext('isHoliday', '').strip()
+                  try:
+                      parsed = dt.datetime.strptime(date, '%Y%m%d').date()
+                  except ValueError:
+                      raise SafeError('Invalid holiday date.') from None
+                  if len(date) != 8 or parsed.year != year or not name or len(name) > 150 or flag not in ('Y', 'N'):
+                      raise SafeError('Invalid holiday record.')
+                  if flag == 'Y':
+                      rows.append({'date': parsed.isoformat(), 'name': name})
+              return total, len(items), rows
+
+          def fetch_page(key, year, page):
+              params = urllib.parse.urlencode({'ServiceKey': key, 'solYear': year, 'pageNo': page, 'numOfRows': 100})
+              for attempt in range(3):
+                  try:
+                      request = urllib.request.Request(ENDPOINT + '?' + params, headers={'User-Agent': 'StickyTodo-Holidays/1.0'})
+                      with urllib.request.urlopen(request, timeout=25) as response:
+                          return response.read(MAX_BYTES + 1)
+                  except (urllib.error.URLError, TimeoutError, OSError):
+                      if attempt == 2:
+                          raise SafeError('API connection failed. Retry later; check API approval and secret.') from None
+                      time.sleep(2 ** attempt)
+
+          def fetch_year(key, year):
+              rows, received, expected = [], 0, None
+              for page in range(1, 12):
+                  total, count, found = parse_page(fetch_page(key, year, page), year)
+                  if expected is not None and total != expected:
+                      raise SafeError('API changed during pagination. Retry later.')
+                  expected = total
+                  received += count
+                  rows.extend(found)
+                  if received == total:
+                      return rows
+                  if count == 0 or received > total:
+                      raise SafeError('Incomplete API pagination.')
+              raise SafeError('Too many API pages.')
+
+          def make_document(year_rows, now):
+              merged = {}
+              for rows in year_rows.values():
+                  for row in rows:
+                      merged.setdefault(row['date'], set()).add(row['name'])
+              return {
+                  'version': 1,
+                  'country': 'KR',
+                  'source': 'https://www.data.go.kr/data/15012690/openapi.do',
+                  'updatedAt': now.isoformat(),
+                  'years': sorted(year_rows),
+                  'holidays': [{'date': date, 'name': ' / '.join(sorted(names))} for date, names in sorted(merged.items())]
+              }
+
+          def main():
+              key = os.environ.get('DATA_GO_KR_SERVICE_KEY', '').strip()
+              if not key or len(key) > 2048 or any(c.isspace() for c in key):
+                  raise SafeError('Set repository secret DATA_GO_KR_SERVICE_KEY to the Decoding service key.')
+              # Accept an accidentally pasted Encoding key without double encoding it.
+              if '%' in key:
+                  key = urllib.parse.unquote(key)
+              now = dt.datetime.now(dt.timezone.utc)
+              year = now.astimezone(dt.timezone(dt.timedelta(hours=9))).year
+              year_rows = {}
+              for target in (year - 1, year, year + 1):
+                  rows = fetch_year(key, target)
+                  if rows:
+                      year_rows[target] = rows
+                  elif target <= year:
+                      raise SafeError('Required year returned no holidays. Existing data was not changed.')
+                  else:
+                      print('Next-year data is not published yet; it will be checked on the next run.')
+              doc = make_document(year_rows, now)
+              output = Path('data/kr-holidays.json')
+              output.parent.mkdir(exist_ok=True)
+              temporary = output.with_suffix('.tmp')
+              temporary.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+              temporary.replace(output)
+              print('Updated holiday data for ' + ', '.join(map(str, doc['years'])) + '.')
+
+          if __name__ == '__main__':
+              try:
+                  main()
+              except SafeError as error:
+                  print(str(error), file=sys.stderr)
+                  sys.exit(1)
+              except Exception:
+                  # Never print request URLs or exception traces containing the service key.
+                  print('Update failed. Existing data was not changed; check the configuration and retry.', file=sys.stderr)
+                  sys.exit(1)
+          PY
+      - name: Publish holiday JSON
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- data/kr-holidays.json
+          if git diff --cached --quiet; then
+            echo 'No holiday data changes.'
+          else
+            git commit -m 'Update Korean public holidays'
+            git push
+          fi
